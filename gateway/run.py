@@ -643,6 +643,42 @@ def render_notice_line(notice) -> str:
     return str(getattr(notice, "text", "") or "").strip()
 
 
+
+def _is_telegram_guest_metadata(metadata: Optional[Dict[str, Any]]) -> bool:
+    return bool(
+        metadata
+        and (
+            metadata.get("telegram_guest_query_id")
+            or metadata.get("telegram_guest_inline_message_id")
+        )
+    )
+
+
+def _should_suppress_final_send_after_stream(
+    *,
+    response_text: str,
+    response_previewed: bool,
+    response_transformed: bool,
+    stream_consumer: Any,
+    metadata: Optional[Dict[str, Any]],
+) -> bool:
+    if not response_text or response_text == "(empty)":
+        return False
+    if response_transformed:
+        return False
+    # This helper intentionally only reports the consumer's delivery state.
+    # The main turn-finalisation path additionally verifies delivered text
+    # against the completed response before it suppresses a normal send.
+    streamed = bool(
+        stream_consumer
+        and getattr(stream_consumer, "final_response_sent", False)
+    )
+    content_delivered = bool(
+        stream_consumer
+        and getattr(stream_consumer, "final_content_delivered", False)
+    )
+    return bool(streamed or content_delivered)
+
 async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
     """Route a status message through adapter.send_or_update_status when supported.
 
@@ -19714,7 +19750,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        platform_metadata = getattr(source, "platform_metadata", None)
+        if platform_metadata:
+            merged = dict(platform_metadata)
+            if metadata:
+                merged.update(metadata)
+            return merged
         return metadata
+
+    def _progress_metadata_for_source(
+        self,
+        source,
+        reply_to_message_id: Optional[str],
+        progress_thread_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Build progress metadata while preserving platform routing state."""
+        if not progress_thread_id:
+            return self._thread_metadata_for_source(source, reply_to_message_id)
+        if str(progress_thread_id) == str(getattr(source, "thread_id", None)):
+            return self._thread_metadata_for_source(source, reply_to_message_id)
+        metadata = dict(getattr(source, "platform_metadata", None) or {})
+        metadata.update(self._thread_metadata_for_target(
+            source.platform,
+            source.chat_id,
+            progress_thread_id,
+            chat_type=getattr(source, "chat_type", None),
+            reply_to_message_id=reply_to_message_id,
+        ) or {})
+        return metadata or None
 
     def _thread_metadata_for_target(
         self,
@@ -23584,17 +23647,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.platform, source.thread_id, event_message_id,
             reply_in_thread=_progress_reply_in_thread,
         )
-        _progress_metadata = (
-            self._thread_metadata_for_source(source, event_message_id)
-            if _progress_thread_id == source.thread_id
-            else self._thread_metadata_for_target(
-                source.platform,
-                source.chat_id,
-                _progress_thread_id,
-                chat_type=getattr(source, "chat_type", None),
-                reply_to_message_id=event_message_id,
-            )
-        ) if _progress_thread_id else None
+        _progress_metadata = self._progress_metadata_for_source(
+            source, event_message_id, _progress_thread_id,
+        )
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
         _progress_reply_to = (
             event_message_id
@@ -23708,17 +23763,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = (
-                self._thread_metadata_for_source(source, event_message_id)
-                if _progress_thread_id == source.thread_id
-                else self._thread_metadata_for_target(
-                    source.platform,
-                    source.chat_id,
-                    _progress_thread_id,
-                    chat_type=getattr(source, "chat_type", None),
-                    reply_to_message_id=event_message_id,
-                )
-            ) if _progress_thread_id else None
+            _status_thread_metadata = self._progress_metadata_for_source(
+                source, event_message_id, _progress_thread_id,
+            )
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the
@@ -24755,7 +24802,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            _suppress_final_send = bool(
+                not _is_empty_sentinel
+                and not _transformed
+                and (_streamed or _content_delivered)
+            )
+            if _suppress_final_send:
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",

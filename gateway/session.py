@@ -23,6 +23,11 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 
+def _session_key_component(value: Any) -> str:
+    """Return a safe single component for colon-delimited session keys."""
+    return str(value).replace(":", "_")
+
+
 def _now() -> datetime:
     """Return the current local time."""
     return datetime.now()
@@ -182,6 +187,7 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+    platform_metadata: Optional[Dict[str, Any]] = None  # Ephemeral platform routing data
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -1071,6 +1077,12 @@ def build_session_key(
         if source.platform == Platform.SLACK and source.scope_id
         else None
     )
+    platform_metadata = getattr(source, "platform_metadata", None)
+    session_key_suffix = None
+    if isinstance(platform_metadata, dict):
+        raw_suffix = platform_metadata.get("session_key_suffix")
+        if raw_suffix:
+            session_key_suffix = _session_key_component(raw_suffix)
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -1083,6 +1095,8 @@ def build_session_key(
             dm_parts.append(dm_chat_id)
             if source.thread_id:
                 dm_parts.append(source.thread_id)
+            if session_key_suffix:
+                dm_parts.append(session_key_suffix)
             return ":".join(str(part) for part in dm_parts)
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
@@ -1100,9 +1114,13 @@ def build_session_key(
             dm_parts.append(str(dm_participant_id))
             if source.thread_id:
                 dm_parts.append(source.thread_id)
+            if session_key_suffix:
+                dm_parts.append(session_key_suffix)
             return ":".join(str(part) for part in dm_parts)
         if source.thread_id:
             dm_parts.append(source.thread_id)
+        if session_key_suffix:
+            dm_parts.append(session_key_suffix)
         return ":".join(str(part) for part in dm_parts)
 
     participant_id = source.user_id_alt or source.user_id
@@ -1129,6 +1147,8 @@ def build_session_key(
 
     if isolate_user and participant_id:
         key_parts.append(str(participant_id))
+    if session_key_suffix:
+        key_parts.append(str(session_key_suffix))
 
     return ":".join(str(part) for part in key_parts)
 
@@ -1686,6 +1706,11 @@ class SessionStore:
         if not callable(finder):
             return None
         try:
+            platform_metadata = getattr(source, "platform_metadata", None)
+            exact_only = bool(
+                isinstance(platform_metadata, dict)
+                and platform_metadata.get("session_key_suffix")
+            )
             return finder(
                 source=source.platform.value,
                 user_id=source.user_id,
@@ -1693,6 +1718,7 @@ class SessionStore:
                 chat_id=source.chat_id if allow_peer_fallback else None,
                 chat_type=source.chat_type if allow_peer_fallback else None,
                 thread_id=source.thread_id,
+                exact_only=exact_only,
             )
         except Exception as exc:
             logger.debug(
