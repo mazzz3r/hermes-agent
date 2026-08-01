@@ -4019,7 +4019,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs, httpx_kwargs=_with_limits()
                 )
 
-            get_updates_request = self._instrument_polling_request(get_updates_request)
+            # Keep PTB's native getUpdates request unwrapped while diagnosing
+            # a guest-update delivery regression. This adapter-level wrapper
+            # was introduced after the previously working guest deployment;
+            # bypass it so raw polling responses reach PTB unchanged.
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
