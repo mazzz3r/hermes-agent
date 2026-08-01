@@ -4024,8 +4024,11 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
             
-            # Register handlers
+            # Register handlers. The trace handler is intentionally limited to
+            # Bot API 10/business update fields and lets operators distinguish
+            # Telegram delivery failures from guest-message routing failures.
             if TypeHandler is not None:
+                self._app.add_handler(TypeHandler(Update, self._trace_botapi10_update), group=-1)
                 self._app.add_handler(TypeHandler(Update, self._handle_guest_update), group=1)
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -4163,6 +4166,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # omitting it here silently drops them after a failed
                         # Telegram initialization/reconnect.
                         if TypeHandler is not None:
+                            self._app.add_handler(TypeHandler(Update, self._trace_botapi10_update), group=-1)
                             self._app.add_handler(TypeHandler(Update, self._handle_guest_update), group=1)
                         self._app.add_handler(TelegramMessageHandler(
                             filters.TEXT & ~filters.COMMAND,
@@ -9030,6 +9034,24 @@ class TelegramAdapter(BasePlatformAdapter):
         if "@" in caller_id:
             check_ids.add(caller_id.split("@", 1)[0])
         return bool(check_ids & allowed)
+
+    async def _trace_botapi10_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Log Bot API 10/business update types without tracing normal traffic."""
+        fields = (
+            "guest_message",
+            "business_message",
+            "edited_business_message",
+            "deleted_business_messages",
+            "business_connection",
+        )
+        present = [field for field in fields if getattr(update, field, None) is not None]
+        if present:
+            logger.info(
+                "[%s] Received Telegram Bot API update: %s (update_id=%s)",
+                self.name,
+                ", ".join(present),
+                getattr(update, "update_id", None),
+            )
 
     async def _handle_guest_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle Telegram Bot API 10.0 guest messages."""
