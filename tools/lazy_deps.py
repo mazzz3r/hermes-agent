@@ -203,7 +203,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "memory.mem0": ("mem0ai==2.0.10",),
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
-    "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
+    # Bot API 10.0 guest messages require PTB 22.8. Keep the lazy-install
+    # constraint aligned with the messaging extra and uv.lock; otherwise a
+    # pre-existing 22.6 installation prevents the guest API from being loaded.
+    "platform.telegram": ("python-telegram-bot[webhooks]==22.8",),
     # brotlicffi gives aiohttp a working 2-arg Decompressor.process() for
     # Discord CDN's Brotli-encoded attachments. Without it, aiohttp falls
     # back to google's `Brotli` package (1-arg API), and any .txt/.md/.doc

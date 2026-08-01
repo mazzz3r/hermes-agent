@@ -4019,10 +4019,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs, httpx_kwargs=_with_limits()
                 )
 
-            # Keep PTB's native getUpdates request unwrapped while diagnosing
-            # a guest-update delivery regression. This adapter-level wrapper
-            # was introduced after the previously working guest deployment;
-            # bypass it so raw polling responses reach PTB unchanged.
+            # Observe successful getUpdates responses without altering the
+            # payload PTB parses. Polling readiness is generation-bound and is
+            # recorded exclusively by this instrumented request; bypassing it
+            # leaves the progress event unset and makes every cold start fail
+            # after the verifier deadline, even while polling is healthy.
+            get_updates_request = self._instrument_polling_request(get_updates_request)
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
