@@ -4158,7 +4158,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         old_app = self._app
                         self._app = builder.build()
                         self._bot = self._app.bot
-                        # Re-register handlers on the new app
+                        # Re-register every handler on the rebuilt app. Guest
+                        # messages are dispatched only through TypeHandler;
+                        # omitting it here silently drops them after a failed
+                        # Telegram initialization/reconnect.
+                        if TypeHandler is not None:
+                            self._app.add_handler(TypeHandler(Update, self._handle_guest_update), group=1)
                         self._app.add_handler(TelegramMessageHandler(
                             filters.TEXT & ~filters.COMMAND,
                             self._handle_text_message
