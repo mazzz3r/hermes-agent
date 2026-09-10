@@ -10,6 +10,7 @@ import os
 import html as _html
 import re
 import time
+import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -1688,7 +1689,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # helper and abandon the partial updater (caller rebuilds).
             await _await_with_thread_deadline(
                 app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES, drop_pending_updates=drop_pending_updates, error_callback=_generation_error_callback),
+                    allowed_updates=self._telegram_allowed_updates(), drop_pending_updates=drop_pending_updates, error_callback=_generation_error_callback),
                 timeout=_UPDATER_START_TIMEOUT,
                 on_abandon=((lambda app=app: _shutdown_abandoned_app(app)) if abandon_app_on_timeout else None))
         finally:
@@ -2693,6 +2694,12 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
+        # Bot API 10 guest messages: trace observer (group -1) + guest dispatcher (group 1).
+        # group=1 lets the guest TypeHandler consume guest updates before the message handlers;
+        # the -1 trace group logs Bot API 10/business fields without tracing normal traffic.
+        if TypeHandler is not None:
+            app.add_handler(TypeHandler(Update, self._trace_botapi10_update), group=-1)
+            app.add_handler(TypeHandler(Update, self._handle_guest_update), group=1)
         # gateway_platform_event observer: group 99 observes alongside, never displaces, core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
@@ -2871,7 +2878,7 @@ class TelegramAdapter(BasePlatformAdapter):
         webhook_path = urlparse(webhook_url).path or "/telegram"
         await self._app.updater.start_webhook(
             listen=webhook_host, port=webhook_port, url_path=webhook_path, webhook_url=webhook_url,
-            secret_token=webhook_secret, allowed_updates=Update.ALL_TYPES,
+            secret_token=webhook_secret, allowed_updates=self._telegram_allowed_updates(),
             drop_pending_updates=not is_reconnect,  # push-based ⇒ practically a no-op; mirrors polling
        )
         self._webhook_mode = True
@@ -3343,6 +3350,20 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+        if self._metadata_is_guest(metadata):
+            inline_id = self._guest_inline_message_id(metadata)
+            if inline_id:
+                return await self._edit_guest_inline_message(inline_id, content)
+            query_id = self._guest_query_id(metadata)
+            if query_id:
+                result = await self._answer_guest_query(
+                    query_id,
+                    content,
+                    use_markdown=True,
+                )
+                if result.success and result.message_id and metadata is not None:
+                    metadata["telegram_guest_inline_message_id"] = result.message_id
+                return result
         error_types = self._telegram_error_types()
         try:
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
@@ -3446,6 +3467,13 @@ class TelegramAdapter(BasePlatformAdapter):
         continuations, and return the final chunk's id as the next edit target."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        if self._metadata_is_guest(metadata):
+            inline_id = self._guest_inline_message_id(metadata) or str(message_id)
+            return await self._edit_guest_inline_message(
+                inline_id,
+                content,
+                finalize=finalize,
+            )
         # Rich finalize (Bot API 10.1): edit the preview IN PLACE via rich_message — no fresh send + delete.
         # Before the 4,096 pre-flight because the rich cap is 32,768; falls back to legacy on rejection.
         # Rich finalize (Bot API 10.1): when the completed content has constructs the legacy MarkdownV2 edit
@@ -5715,8 +5743,318 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)
 
+
+    # ------------------------------------------------------------------
+    # Telegram Bot API 10.0 guest messages (mazzz3r fork feature).
+    # Distinct from the legacy ``guest_mode`` group-mention bypass: guest
+    # messages arrive as ``Update.guest_message`` with ``guest_query_id`` /
+    # ``guest_bot_caller_user`` and are answered via ``answerGuestQuery``.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _telegram_allowed_updates() -> list:
+        """Return PTB's known update types plus Bot API 10.0 guest messages."""
+        try:
+            allowed = list(Update.ALL_TYPES)
+        except Exception:
+            allowed = []
+        if "guest_message" not in allowed:
+            allowed.append("guest_message")
+        return allowed
+
+    @staticmethod
+    def _metadata_is_guest(metadata) -> bool:
+        return bool(
+            metadata
+            and (
+                metadata.get("telegram_guest_query_id")
+                or metadata.get("telegram_guest_inline_message_id")
+            )
+        )
+
+    @staticmethod
+    def _guest_inline_message_id(metadata):
+        if not metadata:
+            return None
+        inline_id = metadata.get("telegram_guest_inline_message_id")
+        return str(inline_id) if inline_id else None
+
+    @staticmethod
+    def _guest_query_id(metadata):
+        if not metadata:
+            return None
+        query_id = metadata.get("telegram_guest_query_id")
+        return str(query_id) if query_id else None
+
+    def _guest_single_message_content(self, content: str) -> str:
+        """Clamp Bot API guest replies to one editable Telegram message."""
+        if utf16_len(content) <= self.MAX_MESSAGE_LENGTH:
+            return content
+        note = "\n\n[Response truncated: Telegram guest mode allows only one message.]"
+        budget = self.MAX_MESSAGE_LENGTH - utf16_len(note)
+        if budget <= 0:
+            return note[-self.MAX_MESSAGE_LENGTH:]
+        from gateway.platforms.base import _prefix_within_utf16_limit
+        return _prefix_within_utf16_limit(content, budget).rstrip() + note
+
+    def _guest_inline_result(self, text: str, *, use_markdown: bool = False) -> Dict[str, Any]:
+        message_text = self._guest_single_message_content(text)
+        content: Dict[str, Any] = {"message_text": message_text}
+        if use_markdown:
+            content = {
+                "message_text": self._guest_single_message_content(self.format_message(message_text)),
+                "parse_mode": ParseMode.MARKDOWN_V2,
+            }
+        return {
+            "type": "article",
+            "id": uuid.uuid4().hex,
+            "title": "Hermes response",
+            "input_message_content": content,
+        }
+
+    def _guest_thinking_text(self) -> str:
+        text = (
+            self.config.extra.get("guest_thinking_text")
+            or os.getenv("TELEGRAM_GUEST_THINKING_TEXT")
+            or "\U0001f4ad Thinking..."
+        )
+        return str(text)
+
+    async def _answer_guest_query(
+        self,
+        guest_query_id: str,
+        text: str = "Thinking...",
+        *,
+        use_markdown: bool = False,
+    ) -> SendResult:
+        """Answer a Bot API 10.0 guest query and return its inline message id."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        result = self._guest_inline_result(text, use_markdown=use_markdown)
+
+        async def _call_answer(result_payload: Dict[str, Any]) -> Any:
+            answer = getattr(self._bot, "answer_guest_query", None) or getattr(
+                self._bot, "answerGuestQuery", None
+            )
+            if callable(answer):
+                return await answer(guest_query_id=guest_query_id, result=result_payload)
+            post = getattr(self._bot, "_post", None)
+            if not callable(post):
+                raise RuntimeError("python-telegram-bot does not expose answerGuestQuery")
+            return await post(
+                "answerGuestQuery",
+                {"guest_query_id": guest_query_id, "result": result_payload},
+            )
+
+        try:
+            try:
+                raw = await _call_answer(result)
+            except Exception as fmt_err:
+                if not (
+                    use_markdown
+                    and (
+                        "parse" in str(fmt_err).lower()
+                        or "markdown" in str(fmt_err).lower()
+                    )
+                ):
+                    raise
+                raw = await _call_answer(self._guest_inline_result(text, use_markdown=False))
+
+            inline_id = raw.get("inline_message_id") if isinstance(raw, dict) else getattr(raw, "inline_message_id", None)
+            if not inline_id:
+                return SendResult(success=False, error="answerGuestQuery returned no inline_message_id")
+            return SendResult(success=True, message_id=str(inline_id), raw_response=raw)
+        except Exception as exc:
+            logger.error("[%s] Failed to answer Telegram guest query: %s", self.name, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def _edit_guest_inline_message(
+        self,
+        inline_message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit the single inline message created by answerGuestQuery."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        content = self._guest_single_message_content(content)
+        try:
+            formatted = self._guest_single_message_content(self.format_message(content))
+            try:
+                await self._bot.edit_message_text(
+                    inline_message_id=inline_message_id,
+                    text=formatted,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+            except Exception as fmt_err:
+                if "not modified" in str(fmt_err).lower():
+                    return SendResult(success=True, message_id=inline_message_id)
+                await self._bot.edit_message_text(
+                    inline_message_id=inline_message_id,
+                    text=content,
+                )
+            return SendResult(success=True, message_id=inline_message_id)
+        except Exception as exc:
+            err = str(exc).lower()
+            if "not modified" in err:
+                return SendResult(success=True, message_id=inline_message_id)
+            retryable = any(
+                marker in err
+                for marker in (
+                    "connecterror", "connect error", "connection error", "networkerror",
+                    "network error", "timed out", "temporarily unavailable", "httpx",
+                )
+            )
+            logger.error("[%s] Failed to edit Telegram guest inline message %s: %s", self.name, inline_message_id, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc), retryable=retryable)
+
+    @staticmethod
+    def _obj_field(obj: Any, name: str, default: Any = None) -> Any:
+        value = getattr(obj, name, default)
+        if value is not default:
+            return value
+        api_kwargs = getattr(obj, "api_kwargs", None)
+        if isinstance(api_kwargs, dict):
+            return api_kwargs.get(name, default)
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return default
+
+    def _extract_guest_message(self, update: Update) -> Optional[Message]:
+        guest = getattr(update, "guest_message", None)
+        if guest is not None:
+            return guest
+        api_kwargs = getattr(update, "api_kwargs", None)
+        raw = api_kwargs.get("guest_message") if isinstance(api_kwargs, dict) else None
+        if raw is None:
+            return None
+        try:
+            de_json = getattr(Message, "de_json", None)
+            if callable(de_json):
+                return de_json(raw, self._bot)
+        except Exception:
+            logger.debug("[%s] Failed to parse raw Telegram guest_message", self.name, exc_info=True)
+        return raw
+
+    def _guest_caller_user(self, message: Message) -> Any:
+        caller = self._obj_field(message, "guest_bot_caller_user")
+        if caller is None:
+            caller = getattr(message, "from_user", None)
+        return caller
+
+    def _guest_query_id_from_message(self, message: Message) -> Optional[str]:
+        query_id = self._obj_field(message, "guest_query_id")
+        return str(query_id).strip() if query_id else None
+
+    def _guest_user_id(self, user: Any) -> Optional[str]:
+        user_id = self._obj_field(user, "id")
+        return str(user_id).strip() if user_id is not None else None
+
+    def _guest_user_name(self, user: Any) -> Optional[str]:
+        full_name = self._obj_field(user, "full_name")
+        if full_name:
+            return str(full_name)
+        first_name = self._obj_field(user, "first_name")
+        last_name = self._obj_field(user, "last_name")
+        name = " ".join(str(part) for part in (first_name, last_name) if part)
+        if name:
+            return name
+        username = self._obj_field(user, "username")
+        return str(username) if username else None
+
+    def _telegram_guest_allowed_users(self) -> set:
+        """Return user allowlist entries that may invoke Bot API guest mode."""
+        raw_values = [
+            self.config.extra.get("allow_from"),
+            self.config.extra.get("group_allow_from"),
+            os.getenv("TELEGRAM_ALLOWED_USERS", ""),
+            os.getenv("TELEGRAM_GROUP_ALLOWED_USERS", ""),
+            os.getenv("GATEWAY_ALLOWED_USERS", ""),
+        ]
+        allowed: set = set()
+        for raw in raw_values:
+            if raw is None:
+                continue
+            values = raw if isinstance(raw, list) else str(raw).split(",")
+            allowed.update(str(value).strip() for value in values if str(value).strip())
+        return allowed
+
+    def _is_guest_caller_authorized(self, caller_id: str) -> bool:
+        allowed = self._telegram_guest_allowed_users()
+        if not allowed:
+            return False
+        if "*" in allowed:
+            return True
+        check_ids = {caller_id}
+        if "@" in caller_id:
+            check_ids.add(caller_id.split("@", 1)[0])
+        return bool(check_ids & allowed)
+
+    async def _trace_botapi10_update(self, update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+        """Log Bot API 10/business update types without tracing normal traffic."""
+        fields = (
+            "guest_message",
+            "business_message",
+            "edited_business_message",
+            "deleted_business_messages",
+            "business_connection",
+        )
+        present = [field for field in fields if getattr(update, field, None) is not None]
+        if present:
+            logger.info(
+                "[%s] Received Telegram Bot API update: %s (update_id=%s)",
+                self.name,
+                ", ".join(present),
+                getattr(update, "update_id", None),
+            )
+
+    async def _handle_guest_update(self, update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+        """Handle Telegram Bot API 10.0 guest messages."""
+        msg = self._extract_guest_message(update)
+        if not msg:
+            return
+        text = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+        if not text:
+            return
+        query_id = self._guest_query_id_from_message(msg)
+        if not query_id:
+            logger.warning("[%s] Dropping Telegram guest_message without guest_query_id", self.name)
+            return
+
+        caller = self._guest_caller_user(msg)
+        caller_id = self._guest_user_id(caller)
+        if not caller_id:
+            logger.warning("[%s] Dropping Telegram guest_message without caller user id", self.name)
+            return
+
+        caller_name = self._guest_user_name(caller)
+        if not self._is_guest_caller_authorized(caller_id):
+            logger.warning("[%s] Unauthorized Telegram guest_message caller: %s (%s)", self.name, caller_id, caller_name)
+            return
+
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=getattr(update, "update_id", None))
+        event.text = self._clean_bot_trigger_text(text)
+        event.source.user_id = caller_id
+        event.source.user_name = caller_name
+        # Guest query/update/message identifiers can remain stable across multiple
+        # turns in the same Telegram guest conversation. Give every guest turn its
+        # own Hermes session so transcript context never leaks between invocations.
+        turn_nonce = uuid.uuid4().hex[:12]
+        event.source.platform_metadata = {
+            "telegram_guest_query_id": query_id,
+            "session_key_suffix": f"telegram_guest_{query_id}_{turn_nonce}",
+        }
+        ack = await self._answer_guest_query(query_id, self._guest_thinking_text())
+        if not ack.success:
+            return
+        event.source.platform_metadata["telegram_guest_inline_message_id"] = ack.message_id
+        await self.handle_message(event)
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text; buffers client-split chunks into one MessageEvent."""
+        if self._extract_guest_message(update) is not None:
+            return
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -5731,6 +6069,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
+        if self._extract_guest_message(update) is not None:
+            return
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -5750,6 +6090,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
+        if self._extract_guest_message(update) is not None:
+            return
         msg = self._effective_update_message(update)
         if not msg:
             return
@@ -6532,7 +6874,7 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     _bridge_gate(
         "group_allowed_chats", "TELEGRAM_GROUP_ALLOWED_CHATS",
         telegram_cfg.get("group_allowed_chats") or _telegram_extra.get("group_allowed_chats"))
-    for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages", "free_response_topics"):
+    for _key in ("guest_mode", "guest_thinking_text", "disable_link_previews", "observe_unmentioned_group_messages", "free_response_topics"):
         if _key in telegram_cfg:
             extras.setdefault(_key, telegram_cfg[_key])
     # Pass through telegram-specific extra keys but EXCLUDE generic shared-config keys: _merge_platform_map

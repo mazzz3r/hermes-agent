@@ -167,11 +167,17 @@ class SessionRecoveryMixin:
         if not callable(finder):
             return None
         try:
+            platform_metadata = getattr(source, "platform_metadata", None)
+            exact_only = bool(
+                isinstance(platform_metadata, dict)
+                and platform_metadata.get("session_key_suffix")
+            )
             return finder(
                 source=source.platform.value, user_id=source.user_id, session_key=session_key,
                 chat_id=source.chat_id if allow_peer_fallback else None,
                 chat_type=source.chat_type if allow_peer_fallback else None,
-                thread_id=source.thread_id)
+                thread_id=source.thread_id,
+                exact_only=exact_only)
         except Exception as exc:
             logger.debug("Gateway session DB recovery failed for %s: %s", session_key, exc)
             if raise_on_lookup_error:

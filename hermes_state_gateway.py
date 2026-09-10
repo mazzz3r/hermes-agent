@@ -380,6 +380,7 @@ class SessionGatewayMixin:
     def find_latest_gateway_session_for_peer(
         self, *, source: str, user_id: Optional[str] = None, session_key: Optional[str] = None,
         chat_id: Optional[str] = None, chat_type: Optional[str] = None, thread_id: Optional[str] = None,
+        exact_only: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Find the latest recoverable gateway session for a routing peer. The durable ``session_key`` on the row rebuilds a missing/pruned ``sessions.json`` mapping. Rows
         ended only by the old ``agent_close`` bug or a mistaken TUI ``ws_orphan_reap`` are recoverable;
@@ -406,7 +407,10 @@ class SessionGatewayMixin:
             row = conn.execute(_PEER_BY_KEY_SQL, (session_key, source)).fetchone()
             if row is not None:
                 return self._session_row_dict(row)
-            if chat_id is None or chat_type is None:
+            if exact_only or chat_id is None or chat_type is None:
+                # exact_only (suffix-scoped sources, e.g. Bot API 10 guest turns): the
+                # peer-fallback tuple could reopen another turn's transcript; only the
+                # exact session_key row above may recover.
                 return None
             # Profile fence (#74285): a Telegram DM's peer tuple is identical for every bot (chat_id ==
             # user_id, no thread), so a sibling profile's row written into this store before the per-profile

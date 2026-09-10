@@ -1486,6 +1486,7 @@ DEFAULT_CONFIG = {
         # per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "channel_prompts": {},
         "allowed_chats": "",  # if set, ONLY respond in these group/supergroup chat IDs
+        "guest_thinking_text": "\U0001f4ad Thinking...",  # Placeholder text for Bot API 10.0 guest-message replies
         "extra": {
             # Bot API 10.1 native rich messages (tables/task lists/math). Off = legacy MarkdownV2,
             # since rich messages are hard to copy as plain text.

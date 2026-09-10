@@ -4050,10 +4050,14 @@ class GatewayRunner(
     def _thread_metadata_for_source(
         self, source, reply_to_message_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
-        metadata = self._thread_metadata_for_target(
-            getattr(source, "platform", None), getattr(source, "chat_id", None),
-            getattr(source, "thread_id", None), chat_type=getattr(source, "chat_type", None),
-            reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None))
+        # Preserve ephemeral platform routing data (e.g. Telegram Bot API 10 guest
+        # query/inline ids) so replies route through the same single-message channel.
+        metadata = dict(getattr(source, "platform_metadata", None) or {})
+        for _k, _v in (self._thread_metadata_for_target(
+                getattr(source, "platform", None), getattr(source, "chat_id", None),
+                getattr(source, "thread_id", None), chat_type=getattr(source, "chat_type", None),
+                reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None)) or {}).items():
+            metadata.setdefault(_k, _v)
         if getattr(source, "platform", None) == Platform.SLACK:
             # Per-turn egress identity: Slack chat.startStream needs recipient_user_id/team_id; the relay
             # adapter's _with_scope fallback reads per-chat caches a CONCURRENT turn overwrites.

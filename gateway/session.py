@@ -22,6 +22,11 @@ from gateway.session_transcript import SessionTranscriptMixin
 logger = logging.getLogger(__name__)
 
 
+def _session_key_component(value: Any) -> str:
+    """Return a safe single component for colon-delimited session keys."""
+    return str(value).replace(":", "_")
+
+
 # -- PII redaction helpers --------------------------------------------------------------------
 
 def _hash_id(value: str) -> str:
@@ -84,6 +89,7 @@ class SessionSource:
     role_authorized: bool = False  # adapter granted access via role, not user ID
     # Multiplex profile this message routes to (None => active/default); namespaces the key.
     profile: Optional[str] = None
+    platform_metadata: Optional[Dict[str, Any]] = None  # Ephemeral platform routing data
     # Transport-local fail-closed signal: explicit profile route whose target is not served.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
     # Discord auto-thread metadata: explicit so pre-existing/renamed threads are never renamed.
@@ -673,12 +679,20 @@ def build_session_key(
     parts = [_session_key_namespace(profile), source.platform.value, chat_type_slot]
     if source.platform == Platform.SLACK and source.scope_id:
         parts.append(str(source.scope_id))
+    platform_metadata = getattr(source, "platform_metadata", None)
+    session_key_suffix = None
+    if isinstance(platform_metadata, dict):
+        raw_suffix = platform_metadata.get("session_key_suffix")
+        if raw_suffix:
+            session_key_suffix = _session_key_component(raw_suffix)
     if chat_id:
         parts.append(chat_id)
     # DMs put the participant before the thread; groups/threads put it after.
     user_part = [str(participant_id)] if isolate_user and participant_id else []
     thread_part = [thread_id] if thread_id else []
     parts += user_part + thread_part if is_dm else thread_part + user_part
+    if session_key_suffix:
+        parts.append(str(session_key_suffix))
     return ":".join(str(part) for part in parts)
 
 
