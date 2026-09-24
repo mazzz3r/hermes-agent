@@ -7167,7 +7167,8 @@ def _resolve_notifications_mode() -> str:
 
 def _build_adapter(config):
     """Construct TelegramAdapter and apply the notification mode."""
-    adapter = TelegramAdapter(config)
+    from plugins.platforms.telegram.guest_messages import GuestTelegramAdapter
+    adapter = GuestTelegramAdapter(config)
     try:
         adapter._notifications_mode = _resolve_notifications_mode()
     except Exception:
